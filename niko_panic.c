@@ -15,6 +15,8 @@
 #include <linux/string.h>
 #include <linux/minmax.h>
 #include <linux/iosys-map.h>
+#include <linux/highmem.h>
+#include <linux/mm.h>
 #include <linux/fb.h>
 #include <linux/panic.h>
 #include <drm/drm_panic.h>
@@ -43,6 +45,22 @@ static bool use_panic_blink;
 module_param(use_panic_blink, bool, 0644);
 MODULE_PARM_DESC(use_panic_blink, "Redraw from panic_blink loop for persistence (default 0)");
 
+// Stop racing drm_panic: override get_scanout_buffer's return value to an error
+// so drm_panic believes it has no buffer and draws nothing — while OUR kretprobe
+// keeps the (already-populated) buffer for niko. Kills the QR-code-wins race
+// regardless of kmsg_dumper ordering. get_scanout_buffer is only ever called
+// from drm_panic, so sabotaging it has no effect on normal operation.
+static bool block_drm_panic = true;
+module_param(block_drm_panic, bool, 0644);
+MODULE_PARM_DESC(block_drm_panic, "Force drm_panic's get_scanout_buffer to fail so only niko draws (default 1)");
+
+// Draw a one-line diagnostic banner at the top (buffer type, dims, plane, path).
+// Our only feedback channel: panic-time printk never reaches the journal, but
+// pixels survive — photograph the screen. Off once things work.
+static bool show_diag = true;
+module_param(show_diag, bool, 0644);
+MODULE_PARM_DESC(show_diag, "Draw a diagnostic banner on the panic screen (default 1)");
+
 // Palette — TWM theme
 #define COLOR_BG     0x000a0010u  // #0a0010
 #define COLOR_PURPLE 0x00c792eau  // #c792ea
@@ -58,9 +76,24 @@ MODULE_PARM_DESC(use_panic_blink, "Redraw from panic_blink loop for persistence 
 #define RIGHT_X      524
 #define MARGIN_Y     40
 
-// Scanout buffer captured from drm_panic's amdgpu call
+// Scanout buffer captured from drm_panic's get_scanout_buffer call
 static struct drm_scanout_buffer captured_sb;
 static bool sb_valid;
+// True once we've captured a DRM_PLANE_TYPE_PRIMARY plane. drm_panic queries
+// every plane (i915 has 4); we want the primary's framebuffer, not a cursor or
+// overlay plane that happens to be queried last.
+static bool captured_primary;
+
+// Diagnostic snapshot of what the captured buffer looked like, stashed at
+// capture time (kretprobe context) and rendered into the on-screen banner.
+static struct {
+	bool primary;
+	bool has_set_pixel;
+	bool has_pages;
+	bool has_map;
+	bool is_iomem;
+	u32  w, h;
+} diag;
 
 // Panic description, saved by the dumper for the panic_blink redraw path.
 #define DESC_MAX 96
@@ -156,20 +189,42 @@ static int scanout_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 static int scanout_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct scanout_capture_data *d = (struct scanout_capture_data *)ri->data;
+	bool is_primary;
 
-	// regs->ax is the int return value; 0 = success
+	// regs->ax is the int return value; 0 = success. A failed call gave us
+	// nothing to capture and nothing to sabotage — leave it alone.
 	if ((int)(long)regs->ax != 0 || !d->sb)
 		return 0;
 
-	memcpy(&captured_sb, d->sb, sizeof(captured_sb));
-	sb_valid = true;
+	is_primary = d->plane && d->plane->type == DRM_PLANE_TYPE_PRIMARY;
 
-	// Suppress fbcon's dmesg takeover: plane->dev->fb_helper->info->skip_panic.
-	// Driver-agnostic — every DRM device with fbdev emulation has this path.
-	if (use_skip_panic &&
-	    d->plane && d->plane->dev && d->plane->dev->fb_helper &&
-	    d->plane->dev->fb_helper->info)
-		d->plane->dev->fb_helper->info->skip_panic = true;
+	// Capture the primary plane's buffer. If we haven't seen a primary yet,
+	// take whatever we get as a fallback; upgrade to the primary when it shows.
+	if (is_primary || !captured_primary) {
+		memcpy(&captured_sb, d->sb, sizeof(captured_sb));
+		sb_valid = true;
+		if (is_primary)
+			captured_primary = true;
+
+		diag.primary       = is_primary;
+		diag.has_set_pixel = d->sb->set_pixel;
+		diag.has_pages     = d->sb->pages;
+		diag.has_map       = d->sb->map[0].vaddr || d->sb->map[0].vaddr_iomem;
+		diag.is_iomem      = d->sb->map[0].is_iomem;
+		diag.w             = d->sb->width;
+		diag.h             = d->sb->height;
+
+		// Suppress fbcon's dmesg takeover.
+		if (use_skip_panic &&
+		    d->plane && d->plane->dev && d->plane->dev->fb_helper &&
+		    d->plane->dev->fb_helper->info)
+			d->plane->dev->fb_helper->info->skip_panic = true;
+	}
+
+	// Stop racing: tell drm_panic this call failed so it draws nothing. We
+	// already copied the populated buffer above, so niko still has it.
+	if (block_drm_panic)
+		regs->ax = (unsigned long)(long)-ENODEV;
 
 	return 0;
 }
@@ -195,15 +250,58 @@ static inline void put_pixel_mem(void *base, u32 pitch,
 	*((u32 *)((char *)base + (u32)y * pitch + (u32)x * 4)) = color;
 }
 
-// Unified helper. amdgpu has two paths: a CPU-mapped buffer (map[0]) OR, for a
-// VRAM-only scanout buffer with no CPU access (the discrete-GPU case), a
-// set_pixel() MMIO callback with map[0] left null. Prefer set_pixel when set,
-// exactly like drm_panic's own draw path.
+// Third access path (e.g. i915): the buffer is handed over as an unmapped page
+// array, accessed one page at a time via kmap_local_page_try_from_panic(). We
+// cache the currently-mapped page so sequential (row-major) writes only remap at
+// page boundaries instead of once per pixel. Must call put_pixel_pages_flush()
+// when done to release the last mapping.
+static long pg_cur = -1;
+static void *pg_vaddr;
+
+static void put_pixel_pages_flush(void)
+{
+	if (pg_vaddr) {
+		kunmap_local(pg_vaddr);
+		pg_vaddr = NULL;
+	}
+	pg_cur = -1;
+}
+
+static inline void put_pixel_pages(struct drm_scanout_buffer *sb, u32 pitch,
+                                    int x, int y, u32 color,
+                                    int xres, int yres)
+{
+	u32 off, pidx, inpg;
+
+	if ((unsigned)x >= (unsigned)xres || (unsigned)y >= (unsigned)yres)
+		return;
+
+	off  = (u32)y * pitch + (u32)x * 4;
+	pidx = off >> PAGE_SHIFT;
+	inpg = off & ~PAGE_MASK;
+
+	if ((long)pidx != pg_cur) {
+		if (pg_vaddr)
+			kunmap_local(pg_vaddr);
+		pg_vaddr = kmap_local_page_try_from_panic(sb->pages[pidx]);
+		pg_cur   = pg_vaddr ? (long)pidx : -1;
+	}
+	if (pg_vaddr)
+		*((u32 *)((char *)pg_vaddr + inpg)) = color;
+}
+
+// Unified helper. Four paths, checked in the order drm_panic itself prefers:
+//   1. set_pixel() callback — discrete VRAM, MMIO writes (amdgpu dGPU)
+//   2. pages[]            — unmapped page array, kmap one page at a time (i915)
+//   3. map[0] iomem       — CPU-visible iomem buffer
+//   4. map[0] memory      — CPU-visible RAM buffer (APU / iGPU)
 #define PUT_PIXEL(sb, pitch, x, y, color, w, h) \
 	do { \
 		if ((sb)->set_pixel) { \
 			if ((unsigned)(x) < (unsigned)(w) && (unsigned)(y) < (unsigned)(h)) \
 				(sb)->set_pixel((sb), (x), (y), (color)); \
+		} else if ((sb)->pages) { \
+			put_pixel_pages(sb, pitch, x, y, color, w, h); \
 		} else if ((sb)->map[0].is_iomem) { \
 			put_pixel_iomem((sb)->map[0].vaddr_iomem, pitch, x, y, color, w, h); \
 		} else { \
@@ -347,8 +445,9 @@ static void niko_render(const char *panic_msg)
 
 	if (!xres || !yres || !pitch)
 		return;
-	// Need either a set_pixel callback (VRAM path) or a valid map (CPU path).
-	if (!sb->set_pixel) {
+	// Need one usable pixel path: set_pixel callback, a page array, or a CPU/
+	// iomem mapping. (pages and map are mutually exclusive per the buffer spec.)
+	if (!sb->set_pixel && !sb->pages) {
 		if (sb->map[0].is_iomem && !sb->map[0].vaddr_iomem)
 			return;
 		if (!sb->map[0].is_iomem && !sb->map[0].vaddr)
@@ -357,7 +456,8 @@ static void niko_render(const char *panic_msg)
 
 	font_big = find_font("ter_16x32");
 	if (!font_big) font_big = find_font("VGA8x16");
-	if (!font_big) return;
+	if (!font_big)
+		return;
 
 	font_sm = find_font("VGA8x16");
 	if (!font_sm) font_sm = font_big;
@@ -379,6 +479,24 @@ static void niko_render(const char *panic_msg)
 		          xres - (niko_x + NIKO_W), NIKO_H, COLOR_BG, xres, yres);
 	} else {
 		fill_rect(sb, pitch, 0, 0, xres, yres, COLOR_BG, xres, yres);
+	}
+
+	// 1b. Diagnostic banner (top-left). Our only feedback channel during a
+	// panic — printk dies with the machine, but the screen survives a photo.
+	if (show_diag) {
+		char dbg[KMSG_LINE_W + 1];
+
+		snprintf(dbg, sizeof(dbg),
+		         "NIKO %ux%u %s path=%s%s%s%s",
+		         diag.w, diag.h,
+		         diag.primary ? "PRIMARY" : "non-primary",
+		         diag.has_set_pixel ? "set_pixel " : "",
+		         diag.has_pages     ? "pages "     : "",
+		         diag.has_map ? (diag.is_iomem ? "iomem " : "mem ") : "",
+		         (!diag.has_set_pixel && !diag.has_pages && !diag.has_map)
+		             ? "NONE" : "");
+		draw_str(sb, pitch, 4, 2, dbg,
+		         COLOR_CYAN, COLOR_BG, font_sm, xres - 4, xres, yres);
 	}
 
 	// 2. Niko
@@ -455,6 +573,9 @@ static void niko_render(const char *panic_msg)
 		y += font_sm->height;
 		i++;
 	}
+
+	// Release any page mapped via the pages[] path.
+	put_pixel_pages_flush();
 }
 
 // ---------------------------------------------------------------------------
